@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create an EC2 instance with the specified configurations
+
+Parameters:
+  InstanceName:
+    Type: String
+    Description: Name of the EC2 instance
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the VPC where the EC2 instance will be created (required)
+  KeyPairName:
+    Type: String
+    Description: Name of the new EC2 Key Pair
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of the subnet where the EC2 instance will be created
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  NewKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Ref KeyPairName
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+      ImageId: !Ref LatestAmiId  # Amazon Linux 2 AMI (HVM), SSD Volume Type
+      InstanceType: t2.micro
+      KeyName: !Ref KeyPairName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          SubnetId: !Ref SubnetId  
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref EC2SecurityGroup           
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum -y update
+          yum -y install php httpd mysql
+          PHP_VERSION=`php -v | head -n 1 | awk '{print $2}' | awk -F "." '{print $1}'`
+          while [ ${PHP_VERSION} -ne 7 ]
+          do
+          amazon-linux-extras install php7.4 -y
+          PHP_VERSION=`php -v | head -n 1 | awk '{print $2}' | awk -F "." '{print $1}'`
+          done
+          yum -y install php-mbstring php-xml
+          wget http://wordpress.org/latest.tar.gz -P /tmp/
+          tar zxvf /tmp/latest.tar.gz -C /tmp
+          cp -r /tmp/wordpress/* /var/www/html/
+          chown apache:apache -R /var/www/html
+          systemctl enable httpd.service
+          systemctl start httpd.service
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the EC2 instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0  # Allow HTTP traffic from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # Allow SSH access from anywhere
+      Tags:
+        - Key: Name
+          Value: AMI SG
+Outputs:
+  KeyPair:
+    Description: New EC2 Key Pair
+    Value: !Ref KeyPairName
+    Export:
+      Name: !Sub "${AWS::StackName}-KeyPairName"
+  EC2InstanceId:
+    Description: ID of the EC2 instance
+    Value: !Ref EC2Instance

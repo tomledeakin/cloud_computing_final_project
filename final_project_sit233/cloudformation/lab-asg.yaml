@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Configure an Auto Scaling Group with Launch Template, ELB, Target Group, and Scaling Policy
+
+Parameters: 
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  LaunchTemplateName:
+    Type: String
+    Description: Enter Launch Template name
+  EC2KeyName:
+    Description: Name of an EC2 KeyPair to enable SSH access to the instance.
+    Type: AWS::EC2::KeyPair::KeyName
+  AutoScalingGroupName:
+    Type: String
+    Description: Enter ASG name
+  PrivateSubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: The ASG should launch instances into the private subnets
+  PrivateSubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: The ASG should launch instances into the private subnets
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of the public subnet 1
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of the public subnet 2
+  LoadBalancerName:
+    Type: String
+    Description: Enter name for Load Balancer
+
+Resources:
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Ref LaunchTemplateName
+      LaunchTemplateData: 
+        ImageId: ami-0a1179631ec8933d7
+        InstanceType: t2.micro
+        KeyName: !Ref EC2KeyName
+        SecurityGroupId:
+          - !Ref WebServerSG    
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum -y update
+            yum -y install php httpd mysql
+            PHP_VERSION=`php -v | head -n 1 | awk '{print $2}' | awk -F "." '{print $1}'`
+            while [ ${PHP_VERSION} -ne 7 ]
+            do
+            amazon-linux-extras install php7.4 -y
+            PHP_VERSION=`php -v | head -n 1 | awk '{print $2}' | awk -F "." '{print $1}'`
+            done
+            yum -y install php-mbstring php-xml
+            wget http://wordpress.org/latest.tar.gz -P /tmp/
+            tar zxvf /tmp/latest.tar.gz -C /tmp
+            cp -r /tmp/wordpress/* /var/www/html/
+            chown apache:apache -R /var/www/html
+            systemctl enable httpd.service
+            systemctl start httpd.service
+        
+  WebServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Web Server
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0  # Allow HTTP traffic from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # Allow SSH access from anywhere
+      Tags:
+        - Key: Name
+          Value: Web Server SG
+
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties: 
+      AutoScalingGroupName: !Ref AutoScalingGroupName
+      LaunchTemplate: 
+        LaunchTemplateName: !Ref LaunchTemplateName
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      AvailabilityZones:
+        - us-east-1a
+        - us-east-1b
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnetId1
+        - !Ref PrivateSubnetId2
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0  # Allow traffic from anywhere
+      Tags:
+        - Key: Name
+          Value: ELB SG
+  
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Ref LoadBalancerName
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1Id
+        - !Ref PublicSubnet2Id
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Scheme: internet-facing
+      IpAddressType: ipv4
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: MyTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Tags:
+        - Key: Name
+          Value: MyTargetGroup
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  WebServerScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebServerAutoScalingGroup
+      Cooldown: 60
+      ScalingAdjustment: 1
+
+  WebServerScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebServerAutoScalingGroup
+      Cooldown: 60
+      ScalingAdjustment: -1
+
+  CPUUtilizationScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-out if CPU >70% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/ELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      AlarmActions:
+        - !Ref WebServerScaleOutPolicy
+      Dimensions: 
+        - Name: LoadBalancerName
+          Value: !Ref WebServerAutoScalingGroup
+      ComparisonOperator: GreaterThanThreshold
+
+  CPUUtilizationScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-in if CPU >25% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/ELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25
+      AlarmActions:
+        - !Ref WebServerScaleOutPolicy
+      Dimensions: 
+        - Name: LoadBalancerName
+          Value: !Ref WebServerAutoScalingGroup
+      ComparisonOperator: LessThanThreshold
+      
+      
+      
+
+
+
